@@ -43,20 +43,21 @@ class SpiderFootScanner():
     __dbh = None
     __targetValue = None
     __targetType = None
+    __targets = None
     __moduleList = list()
     __target = None
     __moduleInstances = dict()
     __modconfig = dict()
     __scanName = None
 
-    def __init__(self, scanName: str, scanId: str, targetValue: str, targetType: str, moduleList: list, globalOpts: dict, start: bool = True) -> None:
+    def __init__(self, scanName: str, scanId: str, targetValue, targetType=None, moduleList: list = None, globalOpts: dict = None, start: bool = True) -> None:
         """Initialize SpiderFootScanner object.
 
         Args:
             scanName (str): name of the scan
             scanId (str): unique ID of the scan
-            targetValue (str): scan target
-            targetType (str): scan target type
+            targetValue (str or list): scan target (single target string) or list of targets
+            targetType (str or None): scan target type (for single target) or None for auto-detection
             moduleList (list): list of modules to run
             globalOpts (dict): scan options
             start (bool): start the scan immediately
@@ -64,10 +65,9 @@ class SpiderFootScanner():
         Raises:
             TypeError: arg type was invalid
             ValueError: arg value was invalid
-
-        Todo:
-             Eventually change this to be able to control multiple scan instances
         """
+        if globalOpts is None:
+            globalOpts = {}
         if not isinstance(globalOpts, dict):
             raise TypeError(f"globalOpts is {type(globalOpts)}; expected dict()")
         if not globalOpts:
@@ -88,20 +88,62 @@ class SpiderFootScanner():
         if not scanId:
             raise ValueError("scanId value is blank")
 
-        if not isinstance(targetValue, str):
-            raise TypeError(f"targetValue is {type(targetValue)}; expected str()")
-        if not targetValue:
-            raise ValueError("targetValue value is blank")
+        # Handle both single target (backward compatibility) and multiple targets
+        if isinstance(targetValue, str):
+            # Single target mode (backward compatibility)
+            if not targetValue:
+                raise ValueError("targetValue value is blank")
 
-        self.__targetValue = targetValue
+            # Auto-detect target type if not provided
+            if targetType is None:
+                targetType = SpiderFootHelpers.targetTypeFromString(targetValue)
+                if not targetType:
+                    raise ValueError(f"Could not determine target type for: {targetValue}")
 
-        if not isinstance(targetType, str):
-            raise TypeError(f"targetType is {type(targetType)}; expected str()")
-        if not targetType:
-            raise ValueError("targetType value is blank")
+            if not isinstance(targetType, str):
+                raise TypeError(f"targetType is {type(targetType)}; expected str()")
+            if not targetType:
+                raise ValueError("targetType value is blank")
 
-        self.__targetType = targetType
+            self.__targetValue = targetValue
+            self.__targetType = targetType
+            self.__targets = [(targetValue, targetType)]
 
+        elif isinstance(targetValue, list):
+            # Multi-target mode
+            if not targetValue:
+                raise ValueError("targetValue list is empty")
+
+            # Validate max 25 targets
+            if len(targetValue) > 25:
+                raise ValueError(f"Too many targets specified ({len(targetValue)}). Maximum is 25.")
+
+            # Parse and validate each target
+            self.__targets = []
+            for target in targetValue:
+                if not isinstance(target, str):
+                    raise TypeError(f"Target is {type(target)}; expected str()")
+                if not target:
+                    continue
+
+                # Auto-detect target type
+                detected_type = SpiderFootHelpers.targetTypeFromString(target)
+                if not detected_type:
+                    raise ValueError(f"Could not determine target type for: {target}")
+
+                self.__targets.append((target, detected_type))
+
+            if not self.__targets:
+                raise ValueError("No valid targets provided")
+
+            # Use first target as primary for backward compatibility
+            self.__targetValue = self.__targets[0][0]
+            self.__targetType = self.__targets[0][1]
+        else:
+            raise TypeError(f"targetValue is {type(targetValue)}; expected str() or list()")
+
+        if moduleList is None:
+            moduleList = []
         if not isinstance(moduleList, list):
             raise TypeError(f"moduleList is {type(moduleList)}; expected list()")
         if not moduleList:
@@ -120,7 +162,15 @@ class SpiderFootScanner():
         self.__sf.scanId = self.__scanId
         self.__dbh.scanInstanceCreate(self.__scanId, self.__scanName, self.__targetValue)
 
-        # Create our target
+        # Add all targets to the database
+        try:
+            self.__dbh.scanTargetsAdd(self.__scanId, self.__targets)
+        except Exception as e:
+            self.__sf.status(f"Scan [{self.__scanId}] failed to add targets: {e}")
+            self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
+            raise ValueError(f"Failed to add targets: {e}") from None
+
+        # Create our target (for backward compatibility, use first target)
         try:
             self.__target = SpiderFootTarget(self.__targetValue, self.__targetType)
         except (TypeError, ValueError) as e:
@@ -267,7 +317,14 @@ class SpiderFootScanner():
 
         try:
             self.__setStatus("STARTING", time.time() * 1000, None)
-            self.__sf.status(f"Scan [{self.__scanId}] for '{self.__target.targetValue}' initiated.")
+            target_count = len(self.__targets)
+            if target_count == 1:
+                self.__sf.status(f"Scan [{self.__scanId}] for '{self.__target.targetValue}' initiated.")
+            else:
+                target_list = ', '.join([t[0] for t in self.__targets[:3]])
+                if target_count > 3:
+                    target_list += f" and {target_count - 3} more"
+                self.__sf.status(f"Scan [{self.__scanId}] for {target_count} targets ({target_list}) initiated.")
 
             self.eventQueue = queue.Queue()
 
@@ -380,17 +437,27 @@ class SpiderFootScanner():
             psMod.outgoingEventQueue = self.eventQueue
             psMod.incomingEventQueue = queue.Queue()
 
-            # Create the "ROOT" event which un-triggered modules will link events to
-            rootEvent = SpiderFootEvent("ROOT", self.__targetValue, "", None)
-            psMod.notifyListeners(rootEvent)
-            firstEvent = SpiderFootEvent(self.__targetType, self.__targetValue,
-                                         "SpiderFoot UI", rootEvent)
-            psMod.notifyListeners(firstEvent)
+            # Create ROOT events for all targets
+            for target_value, target_type in self.__targets:
+                # Create the "ROOT" event for this target
+                rootEvent = SpiderFootEvent("ROOT", target_value, "", None)
+                psMod.notifyListeners(rootEvent)
 
-            # Special case.. check if an INTERNET_NAME is also a domain
-            if self.__targetType == 'INTERNET_NAME' and self.__sf.isDomain(self.__targetValue, self.__config['_internettlds']):
-                firstEvent = SpiderFootEvent('DOMAIN_NAME', self.__targetValue, "SpiderFoot UI", rootEvent)
+                # Update the root_event_hash for this target in the database
+                try:
+                    self.__dbh.scanTargetUpdateRootHash(self.__scanId, target_value, rootEvent.hash)
+                except Exception as e:
+                    self.__sf.error(f"Failed to update root event hash for target {target_value}: {e}")
+
+                # Create the first event with the target type
+                firstEvent = SpiderFootEvent(target_type, target_value,
+                                             "SpiderFoot UI", rootEvent)
                 psMod.notifyListeners(firstEvent)
+
+                # Special case.. check if an INTERNET_NAME is also a domain
+                if target_type == 'INTERNET_NAME' and self.__sf.isDomain(target_value, self.__config['_internettlds']):
+                    domainEvent = SpiderFootEvent('DOMAIN_NAME', target_value, "SpiderFoot UI", rootEvent)
+                    psMod.notifyListeners(domainEvent)
 
             # If in interactive mode, loop through this shared global variable
             # waiting for inputs, and process them until my status is set to

@@ -8,17 +8,18 @@
     <div class="input-group" style='padding-bottom: 10px'>
         <input class='form-control' type="text" id="scanname" name="scanname" value="${scanname}" placeholder="The name of this scan.">
     </div>
-    <label for="scantarget">Scan Target</label>
+    <label for="scantarget">Scan Target(s)</label>
     <div class="input-group">
-        <input class='form-control' type="text" value="${scantarget}" id="scantarget" name="scantarget" placeholder="The target of your scan.">
+        <textarea class='form-control' rows="4" id="scantarget" name="scantarget" placeholder="Enter one or more targets (one per line). Max 25 targets.">${scantarget}</textarea>
     </div>
+    <small class="form-text text-muted">Enter one target per line (max 25 targets)</small>
 </div>
 <div class='col-sm-9' style='font-size: 12px; padding: 0; padding-left: 10px'>
     <div class='panel panel-default' style='background-color: #f7f7f7'>
         <div class='panel-body' style='padding: 0; margin: 10px'>
             <div class='row' style='padding-bottom: 5px'>
                 <div class='col-sm-12'>
-                <i class='glyphicon glyphicon-question-sign'></i>&nbsp;&nbsp;Your scan target may be one of the following. SpiderFoot will automatically detect the target type based on the format of your input:
+                <i class='glyphicon glyphicon-question-sign'></i>&nbsp;&nbsp;Your scan target(s) may be one of the following. SpiderFoot will automatically detect the target type based on the format of your input:
                 </div>
             </div>
             <div class='row'>

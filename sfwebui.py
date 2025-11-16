@@ -1412,13 +1412,49 @@ class SpiderFootWebUi:
 
             return self.error("Invalid request: no modules specified for scan.")
 
-        targetType = SpiderFootHelpers.targetTypeFromString(scantarget)
-        if targetType is None:
+        # Parse multiple targets (newline or comma separated)
+        target_lines = [line.strip() for line in scantarget.replace(',', '\n').split('\n')]
+        target_list = [t for t in target_lines if t]
+
+        if not target_list:
             if cherrypy.request.headers.get('Accept') and 'application/json' in cherrypy.request.headers.get('Accept'):
                 cherrypy.response.headers['Content-Type'] = "application/json; charset=utf-8"
-                return json.dumps(["ERROR", "Unrecognised target type."]).encode('utf-8')
+                return json.dumps(["ERROR", "No valid targets specified."]).encode('utf-8')
 
-            return self.error("Invalid target type. Could not recognize it as a target SpiderFoot supports.")
+            return self.error("Invalid request: no valid targets specified.")
+
+        # Validate max 25 targets
+        if len(target_list) > 25:
+            if cherrypy.request.headers.get('Accept') and 'application/json' in cherrypy.request.headers.get('Accept'):
+                cherrypy.response.headers['Content-Type'] = "application/json; charset=utf-8"
+                return json.dumps(["ERROR", f"Too many targets ({len(target_list)}). Maximum is 25."]).encode('utf-8')
+
+            return self.error(f"Too many targets ({len(target_list)}). Maximum is 25.")
+
+        # For single target, maintain backward compatibility
+        if len(target_list) == 1:
+            scantarget = target_list[0]
+            targetType = SpiderFootHelpers.targetTypeFromString(scantarget)
+            if targetType is None:
+                if cherrypy.request.headers.get('Accept') and 'application/json' in cherrypy.request.headers.get('Accept'):
+                    cherrypy.response.headers['Content-Type'] = "application/json; charset=utf-8"
+                    return json.dumps(["ERROR", "Unrecognised target type."]).encode('utf-8')
+
+                return self.error("Invalid target type. Could not recognize it as a target SpiderFoot supports.")
+        else:
+            # Multi-target mode - validate all targets
+            for target in target_list:
+                targetType = SpiderFootHelpers.targetTypeFromString(target)
+                if targetType is None:
+                    if cherrypy.request.headers.get('Accept') and 'application/json' in cherrypy.request.headers.get('Accept'):
+                        cherrypy.response.headers['Content-Type'] = "application/json; charset=utf-8"
+                        return json.dumps(["ERROR", f"Unrecognised target type for: {target}"]).encode('utf-8')
+
+                    return self.error(f"Invalid target type. Could not recognize '{target}' as a supported target.")
+
+            # For multi-target, pass list instead of single target
+            scantarget = target_list
+            targetType = None  # Scanner will auto-detect
 
         # Swap the globalscantable for the database handler
         dbh = SpiderFootDb(self.config)
@@ -1476,11 +1512,23 @@ class SpiderFootWebUi:
         if "sfp__stor_stdout" in modlist:
             modlist.remove("sfp__stor_stdout")
 
-        # Start running a new scan
-        if targetType in ["HUMAN_NAME", "USERNAME", "BITCOIN_ADDRESS"]:
-            scantarget = scantarget.replace("\"", "")
+        # Normalize targets
+        if isinstance(scantarget, list):
+            # Multi-target mode - normalize each target
+            normalized_targets = []
+            for target in scantarget:
+                ttype = SpiderFootHelpers.targetTypeFromString(target)
+                if ttype in ["HUMAN_NAME", "USERNAME", "BITCOIN_ADDRESS"]:
+                    normalized_targets.append(target.replace("\"", ""))
+                else:
+                    normalized_targets.append(target.lower())
+            scantarget = normalized_targets
         else:
-            scantarget = scantarget.lower()
+            # Single target mode
+            if targetType in ["HUMAN_NAME", "USERNAME", "BITCOIN_ADDRESS"]:
+                scantarget = scantarget.replace("\"", "")
+            else:
+                scantarget = scantarget.lower()
 
         # Start running a new scan
         scanId = SpiderFootHelpers.genScanInstanceId()

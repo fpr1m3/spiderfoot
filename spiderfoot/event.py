@@ -16,6 +16,7 @@ class SpiderFootEvent():
         data (str): Event data, e.g. a URL, port number, webpage content, etc.
         sourceEvent (SpiderFootEvent): SpiderFootEvent that triggered this event
         sourceEventHash (str): Hash of the SpiderFootEvent event that triggered this event
+        rootEventHash (str): Hash of the ROOT event for this event chain (for multi-target support)
         hash (str): Unique SHA256 hash of the event, or "ROOT"
         moduleDataSource (str): Module data source
         actualSource (str): Source data of parent event
@@ -31,6 +32,7 @@ class SpiderFootEvent():
     _data = None
     _sourceEvent = None
     _sourceEventHash = None
+    _rootEventHash = None
     _moduleDataSource = None
     _actualSource = None
     __id = None
@@ -116,6 +118,10 @@ class SpiderFootEvent():
         return self._sourceEventHash
 
     @property
+    def rootEventHash(self) -> str:
+        return self._rootEventHash
+
+    @property
     def actualSource(self) -> str:
         return self._actualSource
 
@@ -131,7 +137,13 @@ class SpiderFootEvent():
             str: unique SHA256 hash of the event, or "ROOT"
         """
         if self.eventType == "ROOT":
-            return "ROOT"
+            # For ROOT events, generate a unique hash and set as rootEventHash
+            digestStr = self.__id.encode('raw_unicode_escape')
+            root_hash = hashlib.sha256(digestStr).hexdigest()
+            # Set rootEventHash to own hash for ROOT events
+            if self._rootEventHash is None:
+                self._rootEventHash = root_hash
+            return root_hash
 
         digestStr = self.__id.encode('raw_unicode_escape')
         return hashlib.sha256(digestStr).hexdigest()
@@ -265,6 +277,8 @@ class SpiderFootEvent():
         if self.eventType == "ROOT":
             self._sourceEvent = None
             self._sourceEventHash = "ROOT"
+            # ROOT events are their own root
+            self._rootEventHash = None  # Will be set to hash after hash is computed
             return
 
         if not isinstance(sourceEvent, SpiderFootEvent):
@@ -272,6 +286,28 @@ class SpiderFootEvent():
 
         self._sourceEvent = sourceEvent
         self._sourceEventHash = self.sourceEvent.hash
+
+        # Inherit root event hash from source event
+        if hasattr(sourceEvent, '_rootEventHash') and sourceEvent._rootEventHash:
+            self._rootEventHash = sourceEvent._rootEventHash
+        elif sourceEvent.eventType == "ROOT":
+            # If source is ROOT, use its hash as root
+            self._rootEventHash = sourceEvent.hash
+
+    @rootEventHash.setter
+    def rootEventHash(self, rootEventHash: str) -> None:
+        """Root event hash for this event chain.
+
+        Args:
+            rootEventHash (str): root event hash
+
+        Raises:
+            TypeError: rootEventHash type was invalid
+        """
+        if rootEventHash is not None and not isinstance(rootEventHash, str):
+            raise TypeError(f"rootEventHash is {type(rootEventHash)}; expected str()")
+
+        self._rootEventHash = rootEventHash
 
     @actualSource.setter
     def actualSource(self, actualSource: str) -> None:

@@ -58,6 +58,13 @@ class SpiderFootDb:
             ended       INT DEFAULT 0, \
             status      VARCHAR NOT NULL \
         )",
+        "CREATE TABLE tbl_scan_targets ( \
+            scan_instance_id    VARCHAR NOT NULL REFERENCES tbl_scan_instance(guid), \
+            target_value        VARCHAR NOT NULL, \
+            target_type         VARCHAR NOT NULL, \
+            root_event_hash     VARCHAR, \
+            PRIMARY KEY (scan_instance_id, target_value) \
+        )",
         "CREATE TABLE tbl_scan_log ( \
             scan_instance_id    VARCHAR NOT NULL REFERENCES tbl_scan_instance(guid), \
             generated           INT NOT NULL, \
@@ -82,7 +89,8 @@ class SpiderFootDb:
             module              VARCHAR NOT NULL, \
             data                VARCHAR, \
             false_positive      INT NOT NULL DEFAULT 0, \
-            source_event_hash  VARCHAR DEFAULT 'ROOT' \
+            source_event_hash  VARCHAR DEFAULT 'ROOT', \
+            root_event_hash    VARCHAR \
         )",
         "CREATE TABLE tbl_scan_correlation_results ( \
             id                  VARCHAR NOT NULL PRIMARY KEY, \
@@ -92,7 +100,8 @@ class SpiderFootDb:
             rule_id             VARCHAR NOT NULL, \
             rule_name           VARCHAR NOT NULL, \
             rule_descr          VARCHAR NOT NULL, \
-            rule_logic          VARCHAR NOT NULL \
+            rule_logic          VARCHAR NOT NULL, \
+            root_event_hash     VARCHAR \
         )",
         "CREATE TABLE tbl_scan_correlation_results_events ( \
             correlation_id      VARCHAR NOT NULL REFERENCES tbl_scan_correlation_results(id), \
@@ -103,7 +112,9 @@ class SpiderFootDb:
         "CREATE INDEX idx_scan_results_hash ON tbl_scan_results (scan_instance_id, hash)",
         "CREATE INDEX idx_scan_results_module ON tbl_scan_results(scan_instance_id, module)",
         "CREATE INDEX idx_scan_results_srchash ON tbl_scan_results (scan_instance_id, source_event_hash)",
+        "CREATE INDEX idx_scan_results_root_hash ON tbl_scan_results (scan_instance_id, root_event_hash)",
         "CREATE INDEX idx_scan_logs ON tbl_scan_log (scan_instance_id)",
+        "CREATE INDEX idx_scan_targets ON tbl_scan_targets (scan_instance_id)",
         "CREATE INDEX idx_scan_correlation ON tbl_scan_correlation_results (scan_instance_id, id)",
         "CREATE INDEX idx_scan_correlation_events ON tbl_scan_correlation_results_events (correlation_id)"
     ]
@@ -373,6 +384,76 @@ class SpiderFootDb:
                     raise IOError("Looks like you are running a pre-4.0 database. Unfortunately "
                                   "SpiderFoot wasn't able to migrate you, so you'll need to delete "
                                   "your SpiderFoot database in order to proceed.") from None
+
+            # Multi-target support migration: Add tbl_scan_targets and root_event_hash column
+            try:
+                self.dbh.execute("SELECT COUNT(*) FROM tbl_scan_targets")
+            except sqlite3.Error:
+                try:
+                    # Add tbl_scan_targets table
+                    self.dbh.execute("CREATE TABLE tbl_scan_targets ( \
+                        scan_instance_id    VARCHAR NOT NULL REFERENCES tbl_scan_instance(guid), \
+                        target_value        VARCHAR NOT NULL, \
+                        target_type         VARCHAR NOT NULL, \
+                        root_event_hash     VARCHAR, \
+                        PRIMARY KEY (scan_instance_id, target_value) \
+                    )")
+                    self.dbh.execute("CREATE INDEX idx_scan_targets ON tbl_scan_targets (scan_instance_id)")
+                    self.conn.commit()
+
+                    # Migrate existing scans to tbl_scan_targets
+                    self.dbh.execute("SELECT guid, seed_target FROM tbl_scan_instance")
+                    scans = self.dbh.fetchall()
+                    for scan_guid, seed_target in scans:
+                        # Determine target type from ROOT event if it exists
+                        self.dbh.execute("SELECT type FROM tbl_scan_results WHERE scan_instance_id = ? AND type != 'ROOT' ORDER BY generated LIMIT 1", [scan_guid])
+                        result = self.dbh.fetchone()
+                        target_type = result[0] if result else "INTERNET_NAME"
+
+                        # Get root event hash
+                        self.dbh.execute("SELECT hash FROM tbl_scan_results WHERE scan_instance_id = ? AND type = 'ROOT' LIMIT 1", [scan_guid])
+                        root_result = self.dbh.fetchone()
+                        root_hash = root_result[0] if root_result else None
+
+                        # Insert into tbl_scan_targets
+                        self.dbh.execute("INSERT INTO tbl_scan_targets (scan_instance_id, target_value, target_type, root_event_hash) VALUES (?, ?, ?, ?)",
+                                         (scan_guid, seed_target, target_type, root_hash))
+                    self.conn.commit()
+                except sqlite3.Error as e:
+                    raise IOError(f"Unable to migrate database for multi-target support: {e}") from e
+
+            # Add root_event_hash column to tbl_scan_results if it doesn't exist
+            try:
+                self.dbh.execute("SELECT root_event_hash FROM tbl_scan_results LIMIT 1")
+            except sqlite3.Error:
+                try:
+                    self.dbh.execute("ALTER TABLE tbl_scan_results ADD COLUMN root_event_hash VARCHAR")
+                    self.dbh.execute("CREATE INDEX idx_scan_results_root_hash ON tbl_scan_results (scan_instance_id, root_event_hash)")
+
+                    # Populate root_event_hash for existing events by tracing back to ROOT
+                    self.dbh.execute("SELECT DISTINCT scan_instance_id FROM tbl_scan_results")
+                    scan_ids = self.dbh.fetchall()
+                    for (scan_id,) in scan_ids:
+                        # Get ROOT event hash for this scan
+                        self.dbh.execute("SELECT hash FROM tbl_scan_results WHERE scan_instance_id = ? AND type = 'ROOT'", [scan_id])
+                        root_result = self.dbh.fetchone()
+                        if root_result:
+                            root_hash = root_result[0]
+                            # Update all events in this scan with the root hash
+                            self.dbh.execute("UPDATE tbl_scan_results SET root_event_hash = ? WHERE scan_instance_id = ?", (root_hash, scan_id))
+                    self.conn.commit()
+                except sqlite3.Error as e:
+                    raise IOError(f"Unable to add root_event_hash column: {e}") from e
+
+            # Add root_event_hash column to tbl_scan_correlation_results if it doesn't exist
+            try:
+                self.dbh.execute("SELECT root_event_hash FROM tbl_scan_correlation_results LIMIT 1")
+            except sqlite3.Error:
+                try:
+                    self.dbh.execute("ALTER TABLE tbl_scan_correlation_results ADD COLUMN root_event_hash VARCHAR")
+                    self.conn.commit()
+                except sqlite3.Error as e:
+                    raise IOError(f"Unable to add root_event_hash column to correlation results: {e}") from e
 
             if init:
                 for row in self.eventDetails:
@@ -672,6 +753,95 @@ class SpiderFootDb:
                 self.conn.commit()
             except sqlite3.Error as e:
                 raise IOError("Unable to create scan instance in database") from e
+
+    def scanTargetsAdd(self, instanceId: str, targets: list) -> None:
+        """Add targets to a scan instance.
+
+        Args:
+            instanceId (str): scan instance ID
+            targets (list): list of tuples (target_value, target_type)
+
+        Raises:
+            TypeError: arg type was invalid
+            IOError: database I/O failed
+        """
+
+        if not isinstance(instanceId, str):
+            raise TypeError(f"instanceId is {type(instanceId)}; expected str()") from None
+
+        if not isinstance(targets, list):
+            raise TypeError(f"targets is {type(targets)}; expected list()") from None
+
+        qry = "INSERT OR REPLACE INTO tbl_scan_targets \
+            (scan_instance_id, target_value, target_type) \
+            VALUES (?, ?, ?)"
+
+        with self.dbhLock:
+            try:
+                for target_value, target_type in targets:
+                    self.dbh.execute(qry, (instanceId, target_value, target_type))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                raise IOError("Unable to add targets to scan instance in database") from e
+
+    def scanTargetsGet(self, instanceId: str) -> list:
+        """Get all targets for a scan instance.
+
+        Args:
+            instanceId (str): scan instance ID
+
+        Returns:
+            list: list of tuples (target_value, target_type, root_event_hash)
+
+        Raises:
+            TypeError: arg type was invalid
+            IOError: database I/O failed
+        """
+
+        if not isinstance(instanceId, str):
+            raise TypeError(f"instanceId is {type(instanceId)}; expected str()") from None
+
+        qry = "SELECT target_value, target_type, root_event_hash FROM tbl_scan_targets \
+            WHERE scan_instance_id = ?"
+
+        with self.dbhLock:
+            try:
+                self.dbh.execute(qry, [instanceId])
+                return self.dbh.fetchall()
+            except sqlite3.Error as e:
+                raise IOError("Unable to retrieve targets for scan instance") from e
+
+    def scanTargetUpdateRootHash(self, instanceId: str, targetValue: str, rootEventHash: str) -> None:
+        """Update the root event hash for a target.
+
+        Args:
+            instanceId (str): scan instance ID
+            targetValue (str): target value
+            rootEventHash (str): root event hash
+
+        Raises:
+            TypeError: arg type was invalid
+            IOError: database I/O failed
+        """
+
+        if not isinstance(instanceId, str):
+            raise TypeError(f"instanceId is {type(instanceId)}; expected str()") from None
+
+        if not isinstance(targetValue, str):
+            raise TypeError(f"targetValue is {type(targetValue)}; expected str()") from None
+
+        if not isinstance(rootEventHash, str):
+            raise TypeError(f"rootEventHash is {type(rootEventHash)}; expected str()") from None
+
+        qry = "UPDATE tbl_scan_targets SET root_event_hash = ? \
+            WHERE scan_instance_id = ? AND target_value = ?"
+
+        with self.dbhLock:
+            try:
+                self.dbh.execute(qry, (rootEventHash, instanceId, targetValue))
+                self.conn.commit()
+            except sqlite3.Error as e:
+                raise IOError("Unable to update target root event hash") from e
 
     def scanInstanceSet(self, instanceId: str, started: str = None, ended: str = None, status: str = None) -> None:
         """Update the start time, end time or status (or all 3) of a scan instance.
@@ -1418,15 +1588,26 @@ class SpiderFootDb:
         if isinstance(truncateSize, int) and truncateSize > 0:
             storeData = storeData[0:truncateSize]
 
+        # Get root_event_hash from event or determine it
+        root_event_hash = None
+        if hasattr(sfEvent, 'rootEventHash'):
+            root_event_hash = sfEvent.rootEventHash
+        elif sfEvent.eventType == "ROOT":
+            # For ROOT events, they are their own root
+            root_event_hash = sfEvent.hash
+        elif hasattr(sfEvent.sourceEvent, 'rootEventHash'):
+            # Inherit from source event
+            root_event_hash = sfEvent.sourceEvent.rootEventHash
+
         # retrieve scan results
         qry = "INSERT INTO tbl_scan_results \
             (scan_instance_id, hash, type, generated, confidence, \
-            visibility, risk, module, data, source_event_hash) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            visibility, risk, module, data, source_event_hash, root_event_hash) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
         qvals = [instanceId, sfEvent.hash, sfEvent.eventType, sfEvent.generated,
                  sfEvent.confidence, sfEvent.visibility, sfEvent.risk,
-                 sfEvent.module, storeData, sfEvent.sourceEventHash]
+                 sfEvent.module, storeData, sfEvent.sourceEventHash, root_event_hash]
 
         with self.dbhLock:
             try:
